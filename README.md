@@ -9,3 +9,10 @@ This repo contains data and code for the analyses in:
 -  socialaging_code_full.rmd - *Rmarkdown code for the full analysis*
 -  socialaging_code_full.html - *Knitted HTML of socialaging_code_full.rmd for visualising workflow*
 
+## Figures
+
+- Fig1.pdf - *pdf version of Figure 1*
+- Fig2.pdf - *pdf version of Figure 2*
+- Fig3.pdf - *pdf version of Figure 3*
+- Fig4.pdf - *pdf version of Figure 4*
+
