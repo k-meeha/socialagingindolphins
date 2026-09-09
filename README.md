@@ -1,47 +1,29 @@
-# Reproducible Research Template
+## Social aging in dolphins
 
-This is an example template to help format a research project from start to finish.
+This repo contains data and code for the analyses in:
 
-Reproducible research is crucial to the scientific enterprise, but the field of animal behavior has been slow to adopt best practices:
+  >Meehan, K.C., Class, B., Nakagawa, S., MacQueeney, M., Foroughirad, V., Mann, J. and Frere, C.H., 2026 PREPRINT. Social aging in dolphins. <i>EcoEvoRxiv</i> [doi: 10.32942/X2KW8W](https://doi.org/10.32942/X2KW8W)
 
-  >Miller, S.E., Jernigan, C.M., Legan, A.W., Miller, C.H., Tumulty, J.P., Walton, A. and Sheehan, M.J., 2021. Animal behavior missing from data archives. <i>Trends in Ecology &   Evolution.</i> [doi: 10.1016/j.tree.2021.07.008](https://doi.org/10.1016/j.tree.2021.07.008)
+## Shared Data
 
-But we can do better! There are some great resources available for increasing reproducibility, and this template should help provide lab-specific information for organizing your project. For more general information, see:   
+- socialaging_main.csv - *base data used for (1) raw data visualisation in the HTML and (2) all models*
+- fig2_a_draws.csv - *predictions used to generate Figure 2a (full population mean response)*
+- fig2_b_draws.csv - *predictions used to generate Figure 2b (females mean response)*
+- fig2_c_draws.csv - *predictions used to generate Figure 2c (males mean response)*
+- fig2_d_draws.csv - *predictions used to generate Figure 2d (full population predictability)*
+- fig2_e_draws.csv - *predictions used to generate Figure 2e (females predictability)*
+- fig2_f_draws.csv - *predictions used to generate Figure 2f (males predictability)*
+- fig3_mean_draws.csv - *individual slopes data for figure 3a mean response*
+- fig3_disp_draws.csv - *individual slopes data for figure 3b predictability*
+- fig4_a.csv - *posterior draws for individual intercepts for figure 4a mean sociability*
+- fig4_b.csv - *posterior draws for individual intercepts for figure 4b predictability*
+- fig4_c.csv - *calculated correlations from 4a and 4b for 4c correlations plot*
 
-   >[A Guide to Reproducible Code in Ecology and Evolution, British Ecological Society, 2017](https://www.britishecologicalsociety.org/wp-content/uploads/2017/12/guide-to-reproducible-code.pdf)
+## Analysis Code and HTML
 
-## Installation
+-  socialaging_code_full.rmd - *Rmarkdown code for the full analysis*
+-  socialaging_code_full.html - *Knitted HTML of socialaging_code_full.rmd for visualising workflow*
 
-This is a template repository, which means you can create a new repository with the same directory structure and files as this exisiting repository. It's similar to creating a fork, but the repository histories will be unrelated. 
-
-To use this template, simply click *Use this Template*, select your account, and name your repository the same way you would when creating a new one. 
-
-
-## Usage
-
-There are eight folders by default, four of which will typically become part of your final public repository upon publication, and four which can remain private or local to you. You can change which folders and files and tracked with a *.gitignore* file. 
-
-Each folder contains a readme with specific instructions. Recommended order is as follows: 
-
-- RawData *(private)*
-- DataCurationCode *(private)*
-- SharedData *(public)*
-- AnalysisCode *(public)*
-- IntermediateData *(public)*
-- TablesFigures *(public)*
-- References *(private)*
-- Drafts *(private)*
-
-## Example repositories
-
-Here are a couple of examples of repositories accompanying the final versions of published papers so you can get a sense of what the end result will look like: 
-
-- Paper: [Foroughirad et al. 2023](https://doi.org/10.1016/j.anbehav.2022.10.011) Repository: [https://github.com/vjf2/Family_Size_Effects](https://github.com/vjf2/Family_Size_Effects)
-- Paper: [Cioffi et al. 2023](https://doi.org/10.1186/s40317-023-00334-1) Repository: [https://github.com/williamcioffi/zc_series](https://github.com/williamcioffi/zc_series)
-
-Note that in both cases the Zenodo platform was also used to create a permanent DOI for the repository
+## TablesFigures
 
 
-## Contributing
-
-Pull requests are welcome. For major changes, open an issue or email me directly <vforough@tamug.edu> 
