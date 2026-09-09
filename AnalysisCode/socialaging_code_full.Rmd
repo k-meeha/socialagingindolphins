@@ -1,0 +1,2780 @@
+---
+title: "Social aging in dolphins"
+author: "Kelley Meehan"
+date: "2026-09-09"
+output: 
+  rmdformats::downcute:
+    code_folding: show
+    code_download: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Knitr settings
+knitr::opts_chunk$set(
+  message=FALSE, 
+  warning=FALSE,
+  tidy=FALSE,
+  cache=TRUE, 
+  cache.lazy = FALSE,
+  rows.print=5,
+  results = 'markup')
+
+# set transparent background in base
+knitr::opts_chunk$set(dev.args=list(bg='transparent'))
+
+# set transparent background in ggplot
+ggplot2::theme_set(ggplot2::theme_classic(base_size=12))
+ggplot2::theme_update(panel.background=ggplot2::element_blank(),
+    plot.background=ggplot2::element_blank(),
+    legend.background=ggplot2::element_blank())
+```
+
+This html documents the final cleaned version of the analysis code used in modeling social aging in dolphins. Analysis was completed in 2026. See software tab for session information.
+
+Created using rmdformats with the downcute theme. <https://github.com/juba/rmdformats>
+
+# **Setup, load, and create dataset**
+
+## Load packages
+
+```{r load packages}
+# load in packages
+library(pacman) # loads and unloads multiple packages in a single line
+pacman::p_load(tidyverse, # for dplyr, magrittr, ggplot, etc
+               lubridate, # wrangling dates and times
+               purrr, # used for reduce(); enhanced programming w/vectors etc
+               here, # more flexible way to read in data
+               ggh4x, # custom facet capacities for ggplot
+               brms, # the man the myth the modelling legend
+               parallel, # functions to parallelise modelling for increased speed
+               loo, # leave one out cross validation for comparing model fit
+               tidybayes, # extracting fits and predictions from brms/rstan models
+               ggpubr, # publication ready plots
+               broom, # converts model objects into tibbles
+               broom.mixed, # broom but for brms type models
+               brmsmargins, # emmeans for brms mean dispersion models
+               reshape2, # reorganising data i.e. melt()
+               coda, # used for HPDinterval
+               patchwork, #to lay out figures neatly
+               modelr, #for seq.range
+               lemon, #for figure arranging
+               ggtext, #partial bolding of character strings
+               figpatch, #image wrangling into ggplots in conjuction w patchwork
+               formatR, #wrapping knitted document
+               ggeffects) # creates dataframes of marginal effects
+                
+# if needed: check which packages are currently loaded
+pacman::p_loaded()
+
+here::i_am("R/socialaging_code_full.Rmd")
+```
+
+## Load data
+
+Data comes from the complete dolphin database managed by Georgetown University and was extracted from the database in multiple excel spreadsheets listed below. Each sheet had linking information either in the form of Observation ID or Dolphin ID.
+
+NOTE: This section curates the data and creates the csv file "socialaging_main.csv". Please note that the provided file has the ID codes anonymised, while parts of this markdown file, which is intended as a visual aid, is not. Locations where code replacements must be made when using the anonymised code have been identified throughout the script.
+
+1.  Survey Dolphin (ds) contains data from each survey conducted, including Observation ID, date and times of observation, Dolphin IDs identified in the survey, and other relevant metadata.
+
+```{r load dolphin survey, out.width=80}
+# ensure all files are closed before loading
+# read in and filter each spreadsheet for the required information
+
+# dolphin survey
+ds <- read.csv(here("gu database", "SurveyDolphin_20251208.csv"), header = T, sep = ",") %>%
+  # convert obs date to date format
+  mutate(Observation.Date = ymd(Observation.Date)) %>% 
+  # make dolphin id a factor
+  mutate(across(where(is.character), factor)) %>% 
+  # only retain sightings where we are sure of a dolphin's ID
+  filter(Dolphin.ID.Certainty == "HIGH") %>% 
+  # remove sightings that don't follow 10m chain rule
+  filter(Beyond.10.Meters.Ind == "False") %>% 
+  # remove unknown animals
+  filter(!Dolphin.ID == "UNKNOWN") %>% 
+  #we only select needed columns from this file
+  select(Observation.ID,
+         Observation.Date,
+         Dolphin.ID) 
+
+# confirm class of each column (should be integer, date, factor)
+sapply(ds, class) 
+
+```
+
+2.  Life History (lh) contains demographic data for each identified dolphin in the database, including birth and death dates or estimates, genetic information if available, sex, parental IDs where known, death date or estimated death date if known or presumed deceased, and other data. This sheet is linked to others via Dolphin ID.
+
+```{r load life history}
+# life history
+lh <- read.csv(here("gu database", "LifeHistory_20251208.csv"), header = T, sep = ",") %>%
+  #convert to date format
+  mutate(Birth.Date = ymd(Birth.Date)) %>%
+  #convert to date format
+  mutate(Death.Date = ymd(Death.Date)) %>% 
+  #convert to date format
+  mutate(Weaning.Date = ymd(Weaning.Date)) %>% 
+  #make dolphin id, mother id, father id, haplotype a factor
+  mutate(across(where(is.character), factor)) %>% 
+  select(Dolphin.ID, # linking vector
+         Dolphin.Name,
+         Sex, 
+         Sex.Certainty,
+         Mother.ID,
+         Father.ID, # not needed currently
+         Haplotype, # not needed currently
+         Birth.Date,
+         Death.Date,
+         Weaning.Date)
+
+sapply(lh, class)
+```
+
+3.  Group Overview (gs) describes the metadata of each survey and the known or estimated group sizes of every observation during the scan sample and for the duration of the full observation. This sheet is linked via Observation ID.
+
+```{r load group overview}
+# group size
+gs <- read.csv(here("gu database", "SurveyGroupOverview_20251208.csv"), header = T, sep = ",") %>%
+  mutate(Observation.Date = ymd(Observation.Date)) %>%
+  filter(Group.Size.Time.Period == "FIRST FIVE MINUTES")
+
+table(gs$Group.Size.Span)
+
+#replacing NAs with estimates (could be improved)
+gs$Group.Size<-ifelse(is.na(gs$Group.Size), gs$Group.Size.Min, gs$Group.Size)
+gs$Group.Size<-ifelse(is.na(gs$Group.Size), gs$Group.Size.Max, gs$Group.Size) 
+  
+gs <- gs %>%
+  select(Observation.ID,
+         Group.Size,
+         # to later count how many groups were range estimates
+         Group.Size.Span) %>% 
+  mutate(Associates = Group.Size - 1) #create response variable
+
+sapply(gs, class) 
+```
+
+## Wrangle datasets and dates
+
+This section merges all unique spreadsheets and uses date and time data to calculate ages of individuals.
+```{r dsl}
+# merge dolphin survey and life history tables
+dslh <- left_join(ds, lh, by = "Dolphin.ID") #join tables
+
+# calculate age at each observation and weaning age for each dolphin 
+dslh <- dslh %>%
+  mutate(dslh, ObsAge = as.numeric(Observation.Date - Birth.Date, units = "days")) %>%
+  #create age of obs and weaning in days
+  mutate(dslh, WeanAge = as.numeric(Weaning.Date - Birth.Date, units = "days")) 
+```
+
+This chunk creates a calf status factor based on known group sizing patterns in females with calves of varying ages. Breaks down individual age into Newborn, Calf, and Non Calf
+
+```{r reproductive status}
+# calculate average weaning date in this dataset
+# this will be used in calculating no calf status for adults
+weanmean <- dslh %>%
+  group_by(Dolphin.ID) %>%
+  summarise(wmean = mean(WeanAge)) %>%
+  na.omit()
+
+mean(weanmean$wmean) #1441.463
+
+
+dslh <- dslh %>%
+  group_by(Dolphin.ID) %>%
+  mutate(adj.Wean = case_when(
+    is.na(WeanAge) ~ 1441,
+    TRUE ~ WeanAge
+  ))  %>%
+  mutate(Repro.Stat = case_when(
+    ObsAge <= 60 ~ "Newborn",
+    ObsAge > 60 & ObsAge <= adj.Wean ~ "Calf",
+    ObsAge > adj.Wean ~ "Not Calf"
+  )) %>%
+  select(-adj.Wean)
+
+```
+
+```{r dslhff}
+# collapse all sheets into a single dataset
+dslhgs <- purrr::reduce(list(dslh, gs), dplyr::left_join, by = "Observation.ID") 
+
+# split off year from dates to produce Year for use as a random effect
+dslhgs <- dslhgs %>%
+  mutate(Year = year(ymd(Observation.Date))) 
+```
+
+## QA/QC dataset
+
+This section removes incomplete entries and NA values and retains known individuals of known sex and age.
+```{r qaqc}
+# various filtering and NA removal
+dslhgs <- dslhgs %>%
+  filter(!Dolphin.ID == "UNKNOWN") %>% #remove the collection of unknown dolphins
+  filter(Sex.Certainty == "HIGH") %>% #remove individuals we haven't sexed
+  filter(!Sex == "UNKNOWN") %>% #removing the random instead of Certainly Unknown Baguette
+  filter(!is.na(Associates)) %>% #removes any NAs
+  filter(!is.na(ObsAge)) %>% #removes any animals we don't have age for
+  droplevels()
+
+# mitigate temporal autocorrelation by reducing dataset to a single obs per animal per day
+dslhgs <- dslhgs %>%
+  arrange(desc(Observation.Date)) %>%
+  distinct(Observation.Date, Dolphin.ID, .keep_all = TRUE) %>%
+  arrange(Observation.Date) 
+```
+
+## Create ALS (Age Last Sighting) variable
+
+This section identifies the age at last or most recent sighting in order to interact this term with age when incorporating effects of selective disappearance. We thank Reviewers 1 and 3 for advice on this area.
+
+```{r calculate ALS}
+alsdat <- dslhgs %>%
+  group_by(Dolphin.ID) %>%
+  arrange(desc(ObsAge)) %>%
+  slice_head(n=1) %>% 
+  rename(ALS = ObsAge) %>%
+  select(Dolphin.ID,
+         ALS) %>%
+  droplevels() %>%
+  ungroup()
+
+dslhgs <- left_join(dslhgs, alsdat, by = "Dolphin.ID")
+```
+
+## Set minimum repeat measures threshold (n ≥ 40)
+
+Predictability requires extensive quantities of repeat measurements for individuals. Based on a review of literature, this study operated on a minimum threshold of 40 repeat measurements per individual.
+```{r repeat measures}
+repmes <- dslhgs %>%
+  group_by(Dolphin.ID) %>%
+  count(Sex, .drop = FALSE) %>%
+  filter(n >= 40) %>%
+  mutate(pass = "pass") %>%
+  select(-Sex)
+
+# create a pass/fail data column to filter
+dslhgs_pass <- left_join(dslhgs, repmes, by = c("Dolphin.ID")) 
+ 
+dslhgs_pass <- dslhgs_pass %>%
+   filter(pass == "pass") %>% # create filtered dataset
+   ungroup()
+```
+
+## Final adjustments
+
+Data wrangling finished with a scaled age variable for modeling and filtering the table for relevant columns
+```{r final}
+dslhgs_pass <- dslhgs_pass %>%
+  mutate(z.Age = as.numeric(scale(ObsAge))) %>%
+  mutate(z.ALS = as.numeric(scale(ALS)))
+
+table(dslhgs_pass$Group.Size.Span) # how many ranges vs points/blank (2320)
+
+final_data <- dslhgs_pass %>%
+  droplevels() %>% #remove levels of any factor emptied during this cleanup
+  select(Observation.ID,
+         Observation.Date,
+         Year,
+         Dolphin.ID, 
+         Sex,
+         ObsAge,
+         z.Age,
+         ALS,
+         z.ALS,
+         Repro.Stat,
+         Associates)
+```
+
+Check completed spreadsheet and export
+```{r csv, eval=FALSE}
+write.csv(final_data, "data/data_socialaging_13032025.csv", row.names = FALSE)
+```
+
+This version is the anonymised version provided publicly. This anonymisation aligned with anonymised codes in the SBDRP data github. Replace "Dolphin.ID" with "anon_id" to use throughout this code.
+```{r anonymise dataset, eval=FALSE}
+anon <- read.csv(here("gu database", "lh_with_anon_id.csv"), header = T, sep = ",") %>%
+  select(Dolphin.ID,
+         anon_id)
+
+anon_data <- final_data %>%
+  left_join(anon, by = "Dolphin.ID") 
+
+anon_data <- anon_data %>%
+  select(-Dolphin.ID)
+
+#write.csv(anon_data, "data/socialaging_main.csv", row.names = FALSE)
+```
+
+# **Complete dataset**
+```{r view table}
+head(final_data, 10)
+```
+
+# **Data Exploration** {.tabset}
+
+## Response distribution by sex
+
+```{r load in data}
+#load exported data (for when starting a new script or working from a different device)
+dat <- read.csv(here("data", "data_socialaging_13032026.csv"), header = TRUE, sep = ",") %>%
+  mutate(across(where(is.character), factor))
+
+# for anonymised data
+# dat <- read.csv(here("data", "socialaging_main.csv"), header = TRUE, sep = ",") %>%
+#   mutate(across(where(is.character), factor))
+
+#split into sexes
+females <- dat %>%
+  filter(Sex == "FEMALE") %>%
+  droplevels()
+
+males <- dat %>%
+  filter(Sex == "MALE") %>%
+  droplevels()
+```
+
+```{r histograms}
+sstrip <- strip_themed(background_x = elem_list_rect(fill = c("#00899a","#c44601"),
+                                                       color = c("black", "black")))
+sex_hist <- ggplot(dat,
+                   aes(x = Associates,
+                       fill = Sex,
+                       colour = Sex)) +
+  geom_histogram(position = "identity", binwidth = 1) +
+  scale_fill_manual(values = c("#00899a","#c44601")) +  
+  scale_colour_manual(values = c("black", "black")) +
+  theme_classic() +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "transparent"), 
+        plot.background = element_rect(fill = "transparent",
+                                       color = NA)) +
+  facet_wrap2(~Sex, strip = sstrip) 
+
+sex_hist
+```
+
+## Response distribution by age of individual at sighting
+```{r histograms 3}
+agehist <- ggplot(dat,
+                  aes(x = ObsAge/365)) +
+  geom_histogram(bins = 53, position = "identity", fill = "#00899a", colour = "black") +
+  theme_classic() +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "transparent"), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA))
+
+agehist
+```
+
+```{r age breakdown 3}
+agebins <- dat %>%
+  mutate(yearage = ObsAge/365) 
+
+agebins <- floor(agebins$yearage)
+
+table(agebins)
+```
+
+
+## Response effect of sex
+
+```{r violins 1}
+sex_plot <- ggplot(dat,
+                   aes(x = Sex,
+                       y = Associates,
+                       colour = Sex)) +
+  geom_jitter(size = 0.1,
+              alpha = 0.2) +  
+  geom_violin(linewidth = 1, 
+              alpha = 0.5) +
+  geom_boxplot(width = 0.1,
+               linewidth = 1) +
+  scale_color_manual(values = c("#00899a","#c44601")) +  
+  theme_classic() + 
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "transparent"), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA))
+sex_plot
+```
+
+## Response effect of reproductive status
+
+```{r reproductive state}
+repro_plot <- ggplot(dat,
+                   aes(x = Repro.Stat,
+                       y = Associates,
+                       colour = Repro.Stat)) +
+  geom_jitter(size = 0.1,
+              alpha = 0.2) +  
+  geom_violin(linewidth = 1, 
+              alpha = 0.5) +
+  geom_boxplot(width = 0.1,
+               linewidth = 1) +
+  scale_color_manual(values = c("#00899a","#c44601", "#607d1c")) +  
+  theme_classic() + 
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "transparent"), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA))
+repro_plot
+```
+
+
+## Response effect of age
+```{r scatterplot}
+age_plot <- ggplot(dat,
+                   aes(x = ObsAge,
+                       y = Associates,
+                       color = Sex)) + 
+  geom_point(size = 0.1,
+             alpha = 0.2) +
+  geom_smooth(method = "gam", formula = y~poly(x,2), se = F,
+              linewidth = 1.5) +
+  scale_color_manual(values = c("#00899a","#c44601")) +  
+    theme_classic() +
+    theme(legend.position = "none",
+          panel.background = element_rect(fill = "transparent"), 
+          plot.background = element_rect(fill = "transparent", 
+                                       color = NA)) 
+
+age_plot
+```
+
+## Yearly breakdown
+```{r sumstats}
+#create table of information about individuals and observations per year
+peryear = aggregate(x = dat$Dolphin.ID, by = list(dat$Year), function (x) length(unique(x)))
+names(peryear) = c("Year", "Number of Individuals") #individuals per year
+
+obsperyear = aggregate(x = dat$Observation.ID, by = list(dat$Year), function(x) length(unique(x)))
+names(obsperyear) = c("Year", "Number of Observations") #observations per year
+
+peryear <- left_join(peryear, obsperyear, by = "Year")
+
+peryear
+```
+
+```{r sumstats 2}
+# average number of years sighted
+years.sighted <- dat %>%
+  count(Dolphin.ID, Year) %>%
+  count(Dolphin.ID)
+
+mean(years.sighted$n); range(years.sighted$n)
+```
+
+## Sex breakdown
+```{r sumstats 3}
+# this informs much of table S2
+meanobs <- dat %>%
+  group_by(Dolphin.ID, Sex) %>%
+  summarise(Count = n()) %>%
+  ungroup()
+
+meanobs <- meanobs %>%
+  mutate(Meanobs = mean(Count))
+
+meanobs <- meanobs %>%
+  group_by(Sex) %>%
+  mutate(MFmeanobs = mean(Count)) %>%
+  mutate(MFstderrobs = (sd(Count)/sqrt(length(unique(Dolphin.ID))))) %>%
+  ungroup() %>%
+  mutate(stderrobs = sd(Count)/sqrt(length(unique(Dolphin.ID)))) %>%
+  select(Sex,
+         Meanobs,
+         stderrobs,
+         MFmeanobs,
+         MFstderrobs) %>%
+  distinct(Sex, .keep_all = TRUE)
+
+meanobs      
+
+#for min and max obs
+datrange <- dat %>%
+  group_by(Dolphin.ID) %>%
+  count(Dolphin.ID)
+
+# sex 
+
+males = dat[dat$Sex=="MALE",]
+females = dat[dat$Sex=="FEMALE",]
+
+length(unique(dat$Dolphin.ID)) #457
+length(unique(males$Dolphin.ID)) #228
+length(unique(females$Dolphin.ID)) #229
+
+
+
+# associates mean/sd
+
+mean(dat$Associates); sd(dat$Associates)
+mean(males$Associates); sd(males$Associates)
+mean(females$Associates); sd(females$Associates)
+
+```
+
+# **Models**
+
+## Set up parallel processing
+```{r parallel}
+# ensure this is customised to specific system
+# this is geared for a windows OS using R shortstop beagle 4.2.3
+if (Sys.getenv("RSTUDIO") == "1" && !nzchar(Sys.getenv("RSTUDIO_TERM")) &&
+    Sys.info()["sysname"] == "Windows" && getRversion() == "4.2.3") {
+  parallel:::setDefaultClusterOptions(setup_strategy = "sequential")
+}
+```
+
+## Create prior
+Note: Stan-dev recommends approximating Penalised Complexity priors for the shape parameter in negative binomial models when measuring dispersion. Best practice approximation is inverse gamma(0.4,0,3). Further information can be found here: https://users.aalto.fi/~ave/casestudies/Priors/negbinomial_shape_prior.html 
+```{r pcprior}
+pcprior <- c(prior_string("inv_gamma(0.4,0.3)", 
+                          class = "sd", 
+                          dpar = "shape"), # dispersion parameter: varies by family
+             prior_string("inv_gamma(0.4,0.3)", 
+                          class = "b", 
+                          coef = "", 
+                          dpar = "shape",
+                          lb = 0))
+```
+
+
+
+## Subset data
+Note: these models are computationally heavy and time-consuming, ranging in processing time from 12-72+ hours per model. Initial models were thus run using a subset of the data to make comparisons, and the best fit models were run using the full dataset compared using pp_check and loo criterion. Selection was made based on parsimony and fit.
+
+```{r sampledat}
+sampledat <- dat[sample(1:nrow(dat), 10000, replace = FALSE),] 
+
+head(sampledat, 10)
+```
+
+```{r sampledat rebuild, eval=FALSE, echo=FALSE}
+# to rebuild correct sample dat if it gets removed from environment on accident
+sampledat <- model.frame(fit_Fszilp_Rd) 
+
+sampledat <- sampledat %>%
+  mutate(rowid = rownames(sampledat)) %>%
+  select(rowid)
+
+dat2 <- dat %>%
+    mutate(rowid = rownames(dat))
+
+sampledat <- sampledat %>%
+  left_join(dat2, by = c("rowid"))
+```
+
+## Model building {.tabset}
+
+```{r model import, echo=FALSE}
+fit_Fszilp_Rd <-readRDS(here("fits", "fit_Fszilp_Rd.rds"))
+fit_Fszilp_Rdy <- readRDS(here("fits", "fit_Fszilp_Rdy.rds"))
+fit_Fszilp_Rdyo <- readRDS(here("fits", "fit_Fszilp_Rdyo.rds"))
+fit_Fsz2ilp_Rdyo <- readRDS(here("fits", "fit_Fsz2ilp_Rdyo.rds"))
+fit_Fsz2ilp_Rz2ldyo <- readRDS(here("fits", "fit_Fsz2ilp_Rz2ldyo.rds"))
+fit_Fsz2ilp_Rz2ldyo2 <- readRDS(here("fits", "fit_Fsz2ilp_Rz2ldyo2.rds"))
+fit_Fsiz2ilp_Rz2dyo2 <- readRDS(here("fits", "fit_Fsiz2ilp_Rz2dyo2.rds"))
+fit_Fsz2ilp_Rz2dyo2 <- readRDS(here("fits", "fit_Fsz2ilp_Rz2dyo2.rds"))
+```
+
+### No interaction, SZiL/D
+```{r SZiL/D, eval=FALSE}
+# no interaction, linear sex, zage*als fixeffs, only Dolphin ID raneffs
+DHGLM_Fszilp_Rd <- bf(Associates ~
+                        Sex + z.Age*z.ALS + Repro.Stat + (1|a|Dolphin.ID),
+                      shape ~ Sex + z.Age*z.ALS + Repro.Stat + (1|a|Dolphin.ID))
+
+fit_Fszilp_Rd <- brm(DHGLM_Fszilp_Rd,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fszilp_Rd.rds")
+
+fit_Fszilp_Rd <-add_criterion(fit_Fszilp_Rd, "loo")
+```
+
+```{r fit_Fszilp_Rd summary}
+summary(fit_Fszilp_Rd)
+```
+
+### No interaction, SZiL/DY
+```{r SZiL/DY, eval = FALSE}
+DHGLM_Fszilp_Rdy <- bf(Associates ~
+                        Sex + z.Age*z.ALS + Repro.Stat + (1|a|Dolphin.ID) + (1|b|Year),
+                      shape ~ Sex + z.Age*z.ALS + Repro.Stat + (1|a|Dolphin.ID) + (1|b|Year))
+
+fit_Fszilp_Rdy <- brm(DHGLM_Fszilp_Rdy,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   init = 1,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fszilp_Rdy.rds")
+
+fit_Fszilp_Rdy <-add_criterion(fit_Fszilp_Rdy, "loo")
+```
+
+```{r fit_Fszilp_Rdy summary}
+summary(fit_Fszilp_Rdy)
+```
+
+### no interaction, SZiL/DYO
+```{r SZiL/DYO, eval = FALSE}
+DHGLM_Fszilp_Rdyo <- bf(Associates ~
+                        Sex + z.Age*z.ALS + (1|a|Dolphin.ID) + Repro.Stat + (1|b|Year) + (1|c|Observation.Date),
+                      shape ~ Sex + z.Age*z.ALS + (1|a|Dolphin.ID) + Repro.Stat + (1|b|Year) + (1|c|Observation.Date))
+
+fit_Fszilp_Rdyo <- brm(DHGLM_Fszilp_Rdyo,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fszilp_Rdyo.rds")
+
+fit_Fszilp_Rdyo <-add_criterion(fit_Fszilp_Rdyo, "loo")
+```
+
+```{r fit_Fszilp_Rdyo summary}
+summary(fit_Fszilp_Rdyo)
+```
+
+### no interaction, SVpolyZiL/DYO
+```{r SZ2iL/DYO, eval = FALSE}
+DHGLM_Fsz2ilp_Rdyo <- bf(Associates ~ 
+                          1 + Sex + poly(z.Age,2)*z.ALS + Repro.Stat + (1|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+                        shape ~ Sex + z.Age*z.ALS + Repro.Stat + (1|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+fit_Fsz2ilp_Rdyo <- brm(DHGLM_Fsz2ilp_Rdyo,
+                      data = sampledat,
+                      family = negbinomial(link = "log", link_shape = "log"),
+                      prior = pcprior,
+                      iter = 5000,
+                      warmup = 3000,
+                      thin = 1,
+                      chains = 2,
+                      cores = 2,
+                      threads = threading(10),
+                      seed = 0920,
+                      file = "fits/fit_Fsz2ilp_Rdyo.rds")
+
+fit_Fsz2ilp_Rdyo <-add_criterion(fit_Fsz2ilp_Rdyo, "loo")
+```
+
+```{r fit_Fsz2ilp_Rdyo summary}
+summary(fit_Fsz2ilp_Rdyo)
+```
+
+### no interaction, SVpolyZiL/polyZLDYO
+```{r SZ2iL/Z2LDYO, eval = FALSE}
+DHGLM_Fsz2ilp_Rz2ldyo <- bf(Associates ~ 
+                          1 + Sex + poly(z.Age,2)*z.ALS + Repro.Stat + (poly(z.Age,2)|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+                        shape ~ Sex + z.Age*z.ALS + Repro.Stat + (1|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+fit_Fsz2ilp_Rz2ldyo <- brm(DHGLM_Fsz2ilp_Rz2ldyo,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fsz2ilp_Rz2ldyo.rds")
+
+fit_Fsz2ilp_Rz2ldyo <-add_criterion(fit_Fsz2ilp_Rz2ldyo, "loo")
+```
+
+```{r fit_Fsz2ilp_Rz2ldyo summary}
+summary(fit_Fsz2ilp_Rz2ldyo)
+```
+
+### include zage in disperson, SpolyZiL/polyZLDYO
+```{r SZ2iL/Z2LDYO2, eval = FALSE}
+DHGLM_Fsz2ilp_Rz2ldyo2 <- bf(Associates ~ 
+                          1 + Sex + poly(z.Age,2)*z.ALS + Repro.Stat + (poly(z.Age,2)|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+                        shape ~ Sex + z.Age*z.ALS + Repro.Stat + (z.Age|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+fit_Fsz2ilp_Rz2ldyo2 <- brm(DHGLM_Fsz2ilp_Rz2ldyo2,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fsz2ilp_Rz2ldyo2.rds")
+
+fit_Fsz2ilp_Rz2ldyo2 <-add_criterion(fit_Fsz2ilp_Rz2ldyo2, "loo")
+```
+
+```{r fit_Fsz2ilp_Rz2ldyo2 summary}
+summary(fit_Fsz2ilp_Rz2ldyo2)
+```
+
+### 3way interaction sex/polyzage/als, SipolyZiL/polyZLDYO
+```{r SiZ2iL/Z2LDYO, eval = FALSE}
+DHGLM_Fsiz2ilp_Rz2dyo2 <- bf(Associates ~ 
+                          1 + Sex*poly(z.Age,2)*z.ALS + Repro.Stat + (poly(z.Age,2)|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+                        shape ~ Sex*z.Age*z.ALS + Repro.Stat + (z.Age|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+fit_Fsiz2ilp_Rz2dyo2 <- brm(DHGLM_Fsiz2ilp_Rz2dyo2,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fsiz2ilp_Rz2dyo2.rds")
+
+fit_Fsiz2ilp_Rz2dyo2 <-add_criterion(fit_Fsiz2ilp_Rz2dyo2, "loo")
+```
+
+```{r fit_Fsiz2ilp_Rz2dyo2 summary}
+summary(fit_Fsiz2ilp_Rz2dyo2)
+```
+
+
+### 2 and 3way interaction sex + or x polyzage/als, SpolyZiL/polyZLDYO
+```{r SZ2iLP/Z2LDYO, eval = FALSE}
+DHGLM_Fsz2ilp_Rz2dyo2 <- bf(Associates ~ 
+                          1 + Sex + poly(z.Age,2)*z.ALS + Repro.Stat + (poly(z.Age,2)|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+                        shape ~ Sex*z.Age*z.ALS + Repro.Stat + (z.Age|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+fit_Fsz2ilp_Rz2dyo2 <- brm(DHGLM_Fsz2ilp_Rz2dyo2,
+                   data = sampledat,
+                   family = negbinomial(link = "log", link_shape = "log"),
+                   prior = pcprior,
+                   iter = 5000,
+                   warmup = 3000,
+                   thin = 1,
+                   chains = 2,
+                   cores = 2,
+                   threads = threading(10),
+                   seed = 0920,
+                   file = "fits/fit_Fsz2ilp_Rz2dyo2.rds")
+
+fit_Fsz2ilp_Rz2dyo2 <-add_criterion(fit_Fsz2ilp_Rz2dyo2, "loo")
+```
+
+```{r fit_Fsz2ilp_Rz2dyo2 summary}
+summary(fit_Fsz2ilp_Rz2dyo2)
+```
+
+### Loo comparison
+
+```{r lootest}
+lootest <- loo_compare(fit_Fszilp_Rd,
+                       fit_Fszilp_Rdy,
+                       fit_Fszilp_Rdyo,
+                       fit_Fsz2ilp_Rdyo,
+                       fit_Fsz2ilp_Rz2ldyo,
+                       fit_Fsz2ilp_Rz2ldyo2, #second best loo
+                       fit_Fsiz2ilp_Rz2dyo2, #best loo
+                       fit_Fsz2ilp_Rz2dyo2,
+                       criterion = "loo",
+                       model_names = NULL) 
+
+print(lootest, simplify = F)
+```
+
+
+The 2 way interaction model with a poly age term and full nested ranefs in mean and dispersion fits the best, followed by 3-way interaction. Both will be run fully.
+
+## Running full models {.tabset}
+
+```{r fullmod import, echo=FALSE}
+mod_1 <- readRDS(here("fits", "mod_1.rds"))
+mod_2 <- readRDS(here("fits", "mod_2.rds"))
+```
+
+### Age x ALS two-way interaction
+```{r 2way interaction full model, eval=FALSE}
+#minor factor reordering for chronological output interpretation
+dat$Repro.Stat <- factor(dat$Repro.Stat, levels = c("Newborn", "Calf", "Not Calf"))
+
+DHGLM_v1 <- bf(Associates ~ 
+                 Sex + poly(z.Age,2)*z.ALS + Repro.Stat + (poly(z.Age,2)|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+               shape ~ Sex + z.Age*z.ALS + Repro.Stat + (z.Age|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+mod_1 <- brm(DHGLM_v1,
+              data = dat,
+              family = negbinomial(link = "log", link_shape = "log"), 
+              prior = pcprior,
+              iter = 30000,
+              warmup = 26000,
+              thin = 1,
+              chains = 2,
+              cores = 2,
+              init = 0,
+              threads = threading(10),
+              seed = 0920,
+              file = "fits/mod_1.rds")
+
+mod_1 <-add_criterion(mod_1, "loo")
+```
+
+```{r mod v1 summary}
+summary(mod_1)
+```
+
+### Sex x Age x ALS three-way interaction
+```{r 3way interaction full model, eval=FALSE}
+DHGLM_v2 <- bf(Associates ~ 
+                          1 + Sex*poly(z.Age,2)*z.ALS + Repro.Stat + (poly(z.Age,2)|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date), 
+                        shape ~ Sex*z.Age*z.ALS + Repro.Stat + (z.Age|a|Dolphin.ID) + (1|b|Year) + (1|c|Observation.Date))
+
+mod_2 <- brm(DHGLM_v2,
+              data = dat,
+              family = negbinomial(link = "log", link_shape = "log"),
+              prior = pcprior,
+              iter = 30000,
+              warmup = 26000,
+              thin = 1,
+              chains = 2,
+              cores = 2,
+              threads = threading(6),
+              seed = 0920,
+              file = "fits/mod_2.rds")
+
+mod_2 <-add_criterion(mod_2, "loo")
+```
+
+```{r mod_2 summary}
+summary(mod_2)
+
+conditional_effects(mod_2)
+```
+
+### Loo comparisons
+
+```{r loo compare}
+loo_compare(mod_1, mod_2)
+```
+
+
+## Posterior predictive checks
+
+```{r ppc checks}
+ppc1 <- pp_check(mod_1,
+         type = "dens_overlay",
+         ndraws = 50) + xlim(0,100) +
+  ggtitle('Full model double interaction')
+
+ppc2 <- pp_check(mod_2,
+         type = "dens_overlay",
+         ndraws = 50) + xlim(0,100)+
+  ggtitle('Full model triple interaction')
+
+ppcfig <- (ppc1/ppc2) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+ppcfig
+```
+
+# **Post-Processing**
+
+This section includes extracting and marginalising fixed effects and extracting and organising random effects used in publication figures.
+
+## Variance components 
+
+```{r variance components}
+varcomps <- VarCorr(mod_2)
+print(varcomps)
+```
+
+## Marginalising fixed effects {.tabset}
+
+First all fixed effects are extracted and marginalised. 
+```{r empirical model fixefs 1}
+## mean.s ##
+margins.mean.s <- brmsmargins(mod_2,
+                              at = data.frame(Sex = c(1,2)),
+                              contrasts = cbind(
+                                "AME Female v Male" = c(1,-1)),
+                              CI = 0.95,
+                              effects = "fixedonly")
+
+margins.mean.s$Summary
+margins.mean.s$ContrastSummary
+```
+
+```{r empirical model fixefs 2}
+## mean.a ##
+h <- 0.001
+margins.mean.a <- brmsmargins(mod_2,
+                              add = data.frame(z.Age = c(0,0+h)),
+                              contrasts = cbind("AME z.Age" = c(-1/h, 1/h)),
+                              CI = 0.95,
+                              effects = "fixedonly") 
+
+margins.mean.a$Summary
+margins.mean.a$ContrastSummary
+```
+
+```{r empirical model fixefs 3}
+## mean.l ##
+h <- 0.001
+margins.mean.l <- brmsmargins(mod_2,
+                              add = data.frame(z.ALS = c(0,0+h)),
+                              contrasts = cbind("AME z.ALS" = c(-1/h, 1/h)),
+                              CI = 0.95,
+                              effects = "fixedonly") 
+
+margins.mean.l$Summary
+margins.mean.l$ContrastSummary
+```
+
+```{r empirical model fixefs 4}
+## mean.r ##
+margins.mean.r <- brmsmargins(mod_2,
+                              at = data.frame(
+                                Repro.Stat = factor(1:3,
+                                                    labels = c("Newborn", "Calf", "Not Calf"))),
+                              contrasts = cbind(
+                                "AME Newborn v Calf" = c(1,-1,0),
+                                "AME Newborn v Not Calf" = c(1,0,-1),
+                                "AME Calf v Not Calf" = c(0,1,-1)),
+                              CI = 0.95,
+                              effects = "fixedonly")
+
+margins.mean.r$Summary
+margins.mean.r$ContrastSummary
+```
+
+```{r empirical model fixefs 5}
+## disp.s ##
+margins.disp.s <- brmsmargins(mod_2,
+                              at = data.frame(Sex = c(1,2)),
+                              contrasts = cbind(
+                                "AME Female v Male" = c(1,-1)),
+                              dpar = "shape",
+                              backtrans = "linear",
+                              CI = 0.95,
+                              effects = "fixedonly")
+
+margins.disp.s$Summary
+margins.disp.s$ContrastSummary
+```
+
+```{r empirical model fixefs 6}
+## disp.a ##
+margins.disp.a <- brmsmargins(mod_1,
+                              add = data.frame(z.Age = c(0,h)),
+                              contrasts = cbind("AME z.Age" = c(-1/h, 1/h)),
+                              dpar = "shape",
+                              backtrans = "linear",
+                              CI = 0.95,
+                              effects = "fixedonly") 
+
+margins.disp.a$Summary
+margins.disp.a$ContrastSummary
+```
+
+```{r empirical model fixefs 7}
+## disp.l ##
+h <- 0.001
+margins.disp.l <- brmsmargins(mod_2,
+                              add = data.frame(z.ALS = c(0,0+h)),
+                              contrasts = cbind("AME z.ALS" = c(-1/h, 1/h)),
+                              dpar = "shape",
+                              backtrans = "linear",
+                              CI = 0.95,
+                              effects = "fixedonly") 
+
+margins.disp.l$Summary
+margins.disp.l$ContrastSummary
+```
+
+```{r empirical model fixefs 8}
+## disp.r ##
+margins.disp.r <- brmsmargins(mod_2,
+                              at = data.frame(
+                                Repro.Stat = factor(1:3,
+                                                    labels = c("Newborn", "Calf", "Not Calf"))),
+                              contrasts = cbind(
+                                "AME Newborn v Calf" = c(1,-1,0),
+                                "AME Newborn v Not Calf" = c(1,0,-1),
+                                "AME Calf v Not Calf" = c(0,1,-1)),
+                              dpar = "shape",
+                              backtrans = "linear",
+                              CI = 0.95,
+                              effects = "fixedonly")
+
+margins.disp.r$Summary
+margins.disp.r$ContrastSummary
+```
+
+Then we create tables out of these extracted effects
+
+```{r empirical model create fixefs tables 1, eval=FALSE}
+# this is the conversions for fixed effects
+# mean s
+posterior.mean.s <- as.data.frame(margins.mean.s$Posterior)
+colnames(posterior.mean.s) <- c("Female", "Male")
+
+posterior.mean.s <- posterior.mean.s %>%
+  melt()
+
+posterior.mean.s <- posterior.mean.s %>%
+  mutate(component = "Mean") %>%
+  mutate(effect = "Sex") 
+
+# mean a
+posterior.mean.a <- as.data.frame(margins.mean.a$Posterior) %>%
+  select(V1) %>%
+  rename(value = V1) %>%
+  mutate(component = "Mean")%>%
+  mutate(variable = "Age") %>%
+  mutate(effect = "Age")
+
+# mean l
+posterior.mean.l <- as.data.frame(margins.mean.l$Posterior) %>%
+  select(V1) %>%
+  rename(value = V1) %>%
+  mutate(component = "Mean")%>%
+  mutate(variable = "ALS") %>%
+  mutate(effect = "ALS")
+
+# mean r
+posterior.mean.r <- as.data.frame(margins.mean.r$Posterior)
+colnames(posterior.mean.r) <- c("Newborn", "Calf", "Not Calf")
+
+posterior.mean.r <- posterior.mean.r %>%
+  melt()
+
+posterior.mean.r <- posterior.mean.r %>%
+  mutate(component = "Mean") %>%
+  mutate(effect = "Reproductive State") 
+```
+
+```{r empirical model create fixefs tables 2,eval=FALSE}
+# this is the conversions for fixed effects
+# disp s #
+posterior.disp.s <- as.data.frame(margins.disp.s$Posterior)
+colnames(posterior.disp.s) <- c("Female", "Male")
+
+posterior.disp.s <- posterior.disp.s %>%
+  melt()
+
+posterior.disp.s <- posterior.disp.s %>%
+  mutate(component = "Dispersion") %>%
+  mutate(effect = "Sex")
+
+# disp a #
+posterior.disp.a <- as.data.frame(margins.disp.a$Posterior) %>%
+  select(V1) %>%
+  rename(value = V1) %>%
+  mutate(component = "Dispersion") %>%
+  mutate(variable = "Age") %>%
+  mutate(effect = "Age") 
+
+# disp l
+posterior.disp.l <- as.data.frame(margins.disp.l$Posterior) %>%
+  select(V1) %>%
+  rename(value = V1) %>%
+  mutate(component = "Dispersion")%>%
+  mutate(variable = "ALS") %>%
+  mutate(effect = "ALS")
+
+# disp r
+posterior.disp.r <- as.data.frame(margins.disp.r$Posterior)
+colnames(posterior.disp.r) <- c("Newborn", "Calf", "Not Calf")
+
+posterior.disp.r <- posterior.disp.r %>%
+  melt()
+
+posterior.disp.r <- posterior.disp.r %>%
+  mutate(component = "Dispersion") %>%
+  mutate(effect = "Reproductive State") 
+```
+
+After fixed effects, random effects are extracted.
+```{r empirical model ranefs 1}
+# note: because these are random effects, i can't use brmsmargins to backtransform 
+# dispersion components, so instead they are extracted using asdrawsmatrix and 
+# exponent-ed to convert back to "latent" scale (which is still log, just not double logged)
+
+## mean portion ##
+mean.intercept <- as.data.frame(as_draws_matrix(mod_2))$"b_Intercept"
+mean(mean.intercept);HPDinterval(as.mcmc(mean.intercept),0.095)
+
+mean.year <- as.data.frame(as_draws_matrix(mod_2))$"sd_Year__Intercept"
+mean(mean.year);HPDinterval(as.mcmc(mean.year),0.095)
+
+mean.date <- as.data.frame(as_draws_matrix(mod_2))$"sd_Observation.Date__Intercept"
+mean(mean.date);HPDinterval(as.mcmc(mean.date),0.095)
+
+mean.id <- as.data.frame(as_draws_matrix(mod_2))$"sd_Dolphin.ID__Intercept"
+mean(mean.id);HPDinterval(as.mcmc(mean.id),0.095)
+```
+
+```{r empirical model ranefs 2}
+## dispersion portion
+disp.intercept <- exp(as.data.frame(as_draws_matrix(mod_2))$"b_shape_Intercept") 
+mean(disp.intercept);HPDinterval(as.mcmc(disp.intercept),0.95)
+
+disp.year <- exp(as.data.frame(as_draws_matrix(mod_2))$"sd_Year__shape_Intercept") 
+mean(disp.year);HPDinterval(as.mcmc(disp.year),0.095)
+
+disp.date <- exp(as.data.frame(as_draws_matrix(mod_2))$"sd_Observation.Date__shape_Intercept")
+mean(disp.date);HPDinterval(as.mcmc(disp.date),0.095)
+
+disp.id <- exp(as.data.frame(as_draws_matrix(mod_2))$"sd_Dolphin.ID__shape_Intercept")
+mean(disp.id);HPDinterval(as.mcmc(disp.id),0.095)
+```
+
+Next, extracted effects are turned into operable tables.
+```{r empirical model create ranefs tables 1, eval=FALSE}
+## mean portion ##
+mean.intercept <- as.data.frame(mean.intercept) %>%
+  mutate(component = "Mean") %>%
+  mutate(effect = "Intercept") %>%
+  mutate(variable = "Intercept") %>%
+  rename(value = mean.intercept)
+
+mean.year <- as.data.frame(mean.year) %>%
+  mutate(component = "Mean") %>%
+  mutate(effect = "Random") %>%
+  mutate(variable = "Year") %>%
+  rename(value = mean.year)
+
+mean.date <- as.data.frame(mean.date) %>%
+  mutate(component = "Mean") %>%
+  mutate(effect = "Random") %>%
+  mutate(variable = "Observation Date") %>%
+  rename(value = mean.date)
+
+mean.id <- as.data.frame(mean.id) %>%
+  mutate(component = "Mean") %>%
+  mutate(effect = "Random") %>%
+  mutate(variable = "Individual") %>%
+  rename(value = mean.id)
+```
+
+```{r empirical model create ranefs tables 2, eval=FALSE}
+## dispersion portion ##
+disp.intercept <- as.data.frame(disp.intercept) %>%
+  mutate(component = "Dispersion") %>%
+  mutate(effect = "Intercept") %>%
+  mutate(variable = "Intercept") %>%
+  rename(value = disp.intercept)
+
+disp.year <- as.data.frame(disp.year) %>%
+  mutate(component = "Dispersion") %>%
+  mutate(effect = "Random") %>%
+  mutate(variable = "Year") %>%
+  rename(value = disp.year)
+
+disp.date <- as.data.frame(disp.date) %>%
+  mutate(component = "Dispersion") %>%
+  mutate(effect = "Random") %>%
+  mutate(variable = "Observation Date") %>%
+  rename(value = disp.date)
+
+disp.id <- as.data.frame(disp.id) %>%
+  mutate(component = "Dispersion") %>%
+  mutate(effect = "Random") %>%
+  mutate(variable = "Individual") %>%
+  rename(value = disp.id)
+```
+
+All extracts are combined together into a data table. These data inform Table 3 and Table S3
+
+```{r combine empirical effects data, eval=FALSE}
+# these have been saved to the "margins" folder
+mean.margins <- bind_rows(posterior.mean.s, posterior.mean.a, posterior.mean.l, posterior.mean.r, mean.intercept, mean.year, 
+                          mean.date, mean.id) 
+disp.margins <- bind_rows(posterior.disp.s, posterior.disp.a, posterior.disp.l, posterior.disp.r, disp.intercept, disp.year, 
+                          disp.date, disp.id) 
+allmargins <- rbind(mean.margins, disp.margins)
+
+write.csv(allmargins, "margins/allmargins.csv", row.names = FALSE)
+write.csv(mean.margins, "margins/meanmargins.csv", row.names = FALSE)
+write.csv(disp.margins, "margins/dispmargins.csv", row.names = FALSE)
+```
+
+```{r import csv files margins 1, echo=FALSE}
+allmargins <- read.csv(here("margins", "allmargins.csv"), header = TRUE, sep = ",")
+mean.margins <- read.csv(here("margins", "meanmargins.csv"), header = TRUE, sep = ",")
+disp.margins <- read.csv(here("margins", "dispmargins.csv"), header = TRUE, sep = ",")
+```
+
+```{r show all margins}
+head(allmargins, 10)
+```
+
+
+# **Figures**
+
+## Figure 1: Concept Graphs {.tabset}
+
+### Personality
+```{r concept figure personality}
+
+df_personality <- data.frame(
+  x = seq(0,10, length.out = 10),
+  y = rep(c(3,5), each = 10),
+  z = rep(c(2.75,4.75), each = 10),
+  z2 = rep(c(3.25,5.25), each = 10),
+  i = rep(c("Individual A", "Individual B"), each = 10)
+)
+
+personalityconcept <- ggplot(df_personality,
+                             aes(x = x,
+                                 y = y,
+                                 fill = i)) +  
+  scale_fill_manual(values = c("#0B76A0", "#C04F15")) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) +
+  geom_ribbon(aes(ymin = z, ymax = z2),
+              alpha = 0.3, 
+              linetype = 'blank') +
+  geom_line(aes(colour = i),linewidth = 1) +
+  scale_x_continuous(expand = expansion(mult = 0), 
+                     limits = c(0,10.1)) +
+  scale_y_continuous(expand = expansion(mult = 0), 
+                     limits = c(2,6)) +
+  labs(x = "Environment", y = "Response") +
+  ggtitle('A', subtitle = "Personality (Mean response)") +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        text = element_text(family = "sans")) +
+  theme(legend.title=element_blank(), 
+        legend.position = "bottom")
+
+a <- personalityconcept
+
+a
+
+```
+
+### Plasticity
+```{r concept figure plasticity}
+df_p1 <- data.frame(
+   x = seq(0,10, length.out = 10),
+   y = seq(3,6, length.out = 10),
+   sd = rep(0.5, each = 10),
+   i = rep(c("Individual A"), each = 10))
+
+df_p2 <- data.frame(
+   x = seq(0,10, length.out = 10),
+   y = seq(5,4, length.out = 10),
+   sd = rep(0.5, each = 10),
+   i = rep(c("Individual B"), each = 10))
+
+df_plasticity <- rbind(df_p1, df_p2)
+
+plasticityconcept <- ggplot(df_plasticity,
+                             aes(x = x,
+                                 y = y,
+                                 fill = i)) +  
+  scale_fill_manual(values = c("#0B76A0", "#C04F15")) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) +
+  geom_line(aes(color = i),linewidth = 1) +
+  geom_ribbon(aes(ymin = y-sd, ymax = y+sd),
+              alpha = 0.3,
+              linetype = 'blank') + 
+  scale_x_continuous(expand = expansion(mult = 0), 
+                     limits = c(0,10.1)) +
+  labs(x = "Environment", y = "Response") +
+  ggtitle('B', subtitle = "Plasticity (Changing mean response)") +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        text = element_text(family = "sans")) +
+  theme(legend.title=element_blank(), 
+        legend.position = "bottom")
+
+b <- plasticityconcept
+
+b
+```
+
+### Predictability
+```{r concept figure predictability}
+df_predictability <- data.frame(
+  x = seq(0,10, length.out = 10),
+  y = rep(c(3,5), each = 10),
+  z = rep(c(2.75,4.25), each = 10),
+  z2 = rep(c(3.25,5.75), each = 10),
+  i = rep(c("Individual A", "Individual B"), each = 10)
+)
+
+predictabilityconcept <- ggplot(df_predictability,
+                             aes(x = x,
+                                 y = y,
+                                 fill = i)) +  
+  scale_fill_manual(values = c("#0B76A0", "#C04F15")) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) +
+  geom_ribbon(aes(ymin = z, ymax = z2),
+              alpha = 0.3, 
+              linetype = 'blank') +
+  geom_line(aes(colour = i),linewidth = 1) +
+  scale_x_continuous(expand = expansion(mult = 0), 
+                     limits = c(0,10.1)) +
+  scale_y_continuous(expand = expansion(mult = 0), 
+                     limits = c(2,6)) +
+  labs(x = "Environment", y = "Response") +
+  ggtitle('C', subtitle = "Predictability (Variance)") +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        text = element_text(family = "sans")) +
+  theme(legend.title=element_blank(), 
+        legend.position = "bottom")
+
+
+c <- predictabilityconcept
+
+c
+```
+
+### Malleability
+```{r concept figure malleability}
+df_m1 <- data.frame(
+   x = seq(0,10, length.out = 10),
+   y = rep(3, length.out = 10),
+   sd = seq(0.25,0.75, length.out = 10),
+   i = rep(c("Individual A"), each = 10))
+
+df_m2 <- data.frame(
+   x = seq(0,10, length.out = 10),
+   y = rep(5, length.out = 10),
+   sd = seq(0.75,0.1, length.out = 10),
+   i = rep(c("Individual B"), each = 10))
+
+df_malleable = rbind(df_m1, df_m2)
+
+malleabilityconcept <- ggplot(df_malleable,
+                             aes(x = x,
+                                 y = y,
+                                 fill = i)) +  
+  scale_fill_manual(values = c("#0B76A0", "#C04F15")) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) +
+  geom_ribbon(aes(ymin = y-sd, ymax = y+sd),
+              alpha = 0.3, 
+              linetype = 'blank') +
+  geom_line(aes(colour = i),linewidth = 1) +
+  scale_x_continuous(expand = expansion(mult = 0), 
+                     limits = c(0,10.1)) +
+  scale_y_continuous(expand = expansion(mult = 0), 
+                     limits = c(2,6)) +
+  labs(x = "Environment", y = "Response") +
+  ggtitle('D', subtitle = "Malleability (Change in variance)") +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        text = element_text(family = "sans")) +
+  theme(legend.title=element_blank(), 
+        legend.position = "bottom")
+
+d <- malleabilityconcept
+
+d
+
+```
+
+### Plasticity and Malleability
+```{r concept figure plastic and malleable}
+
+df_pm1 <- data.frame(
+   x = seq(0,10, length.out = 10),
+   y = seq(5,4, length.out = 10),
+   sd = seq(0.25,0.75, length.out = 10),
+   i = rep(c("Individual A"), each = 10))
+
+df_pm2 <- data.frame(
+   x = seq(0,10, length.out = 10),
+   y = seq(3,6, length.out = 10), 
+   sd = seq(0.75,0.1, length.out = 10),
+   i = rep(c("Individual B"), each = 10))
+
+df_predmal <- rbind(df_pm1, df_pm2)
+
+predmalconcept <- ggplot(df_predmal,
+                             aes(x = x,
+                                 y = y,
+                                 fill = i)) +  
+  scale_fill_manual(values = c("#0B76A0", "#C04F15")) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) +
+  geom_ribbon(aes(ymin = y-sd, ymax = y+sd),
+              alpha = 0.3, 
+              linetype = 'blank') +
+  geom_line(aes(colour = i),linewidth = 1) +
+  scale_x_continuous(expand = expansion(mult = 0), 
+                     limits = c(0,10.1)) +
+  scale_y_continuous(expand = expansion(mult = 0), 
+                     limits = c(2,7)) +
+  labs(x = "Environment", y = "Response") +
+  ggtitle('E', subtitle = "Plasticity (Changing mean) and Malleability (Changing variance)") +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        text = element_text(family = "sans")) +
+  theme(legend.title=element_blank(), 
+        legend.position = "bottom")
+
+e <- predmalconcept
+
+e
+```
+
+```{r combine fig 1 plots, fig.align='center', fig.width=8, fig.height=14}
+figure1 <- (a + theme(legend.position = "hidden")|b + theme(legend.position = "hidden"))/
+  (c + theme(legend.position = "hidden")|d + theme(legend.position = "hidden"))/e
+
+figure1
+
+#ggsave(figure1, filename = here("figures", "Fig1.tiff"), bg = "transparent", device = 'tiff', height = 20, width = 15, units = "cm", dpi = 300, compression = "lzw")
+```
+
+
+
+## Figure 2 {.tabset}
+
+### Figure 2A (Full model)
+
+First, we create predictions for the full model using epred and linpred draws.
+
+```{r predict reponses}
+# needed to unscale z.Age
+m = mean(dat$ObsAge)
+s <- sd(dat$ObsAge)
+
+# needed to unscale ALS
+m_als <- mean(dat$ALS)
+s_als <- sd(dat$ALS)
+
+#create new sequence of data to predict on from the model
+ageseq <- seq_range(dat$z.Age, n = 53)
+alsseq <- seq_range(dat$z.ALS, n = 7, expand = 0.4)  
+alsseq <- alsseq[-c(1,7)] #remove the extension on the left to set initial ALS cap fairly close to weaning age (~3.7yo)
+
+newdat <- expand.grid(
+  z.Age = ageseq,
+  z.ALS = alsseq,
+  Repro.Stat = NA,
+  Sex = c("FEMALE", "MALE"))
+
+# unscale z.Age in new dataset
+newdat <- newdat %>%
+  mutate(Age = ((z.Age * s) + m)) %>%
+  mutate(ALS = ((z.ALS * s_als) + m_als))
+
+# draw epred -- or expectation of the posterior, i.e E(yi) of the model formula
+mean_draws <- mod_2 %>%
+  epred_draws(newdata = newdat, 
+              re_formula = NA) %>%
+  group_by(Sex, Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = mean(.epred))
+
+mean_draws <- mean_draws %>%
+  filter(Age <= ALS) %>%
+  mutate(alsbins = ALS/365) %>%
+  mutate(alsbins = as.factor(alsbins))
+
+#now repeat with dispersion components
+disp_draws <- mod_2  %>%
+  linpred_draws(newdata = newdat, 
+                dpar = "shape", 
+                transform = TRUE, 
+                re_formula = NA) %>%
+  group_by(Sex, Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = mean(.linpred),
+            shape = mean(shape))
+
+ disp_draws <- disp_draws %>%
+  filter(Age <= ALS) %>%
+  mutate(alsbins = ALS/365) %>%
+  mutate(alsbins = as.factor(alsbins))
+ 
+#write.csv(mean_draws, "data/fig2_a_draws.csv", row.names = FALSE)
+#write.csv(disp_draws, "data/fig2_d_draws.csv", row.names = FALSE)
+ 
+#to import, use the following (requires "here" package)
+# mean_draws <- read.csv(here("FILEFOLDERNAME", "fig2_a_draws.csv"), header = TRUE, sep = ",")
+# disp_draws <- read.csv(here("FILEFOLDERNAME", "fig2_d_draws.csv"), header = TRUE, sep = ",")
+
+```
+
+Then, we can utilise those draws to create graphs.
+
+```{r graph mean draws 1}
+# mean response level
+
+# prep data by fixing bins
+levels(mean_draws$alsbins) <- c("<4y", "<16y", "<28y", "<40y", "<53y")
+
+# set breaks for jittered points
+# slightly offset from geom lines for visual balance
+agebreaks = mean_draws %>%
+  filter(Age == c("1481","5553.75","9626.49999999999","14069.5","18142.25"))
+
+mean.cols <- c("<4y" = "#2D3A0D",
+               "<16y" = "#496016",
+               "<28y" = "#607D1C",
+               "<40y" = "#83AA27",
+               "<53y" = "#A0D02F")
+
+# plot code
+meanage <- ggplot(mean_draws, 
+                   aes(x = Age/365,
+                       y = predicted,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(agebreaks, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins),
+              linewidth = 0.75, lineend = "round",
+              method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = mean.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#2D3A0D", "#496016", "#607D1C", "#83AA27", "#A0D02F"),
+                    labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                        labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  ggtitle('A', subtitle = "Full Model: Average") +
+  labs(colour = "Age at Last Sighting", fill = "Age at Last Sighting", linetype = "Age at Last Sighting") +
+  guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+         fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  labs(y = "Associates",
+       colour = "Age at Last Sighting", 
+       fill = "Age at Last Sighting", 
+       linetype = "Age at Last Sighting") +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(2.5,7)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title.y = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))
+
+# plot!
+meanage
+```
+
+```{r graph disp draws 1}
+
+# prep data by fixing bins
+levels(disp_draws$alsbins) <- c("<4y", "<16y", "<28y", "<40y", "<53y")
+
+# set breaks for jittered points
+# slightly offset from geom lines for visual balance
+agebreaks2 = disp_draws %>%
+  filter(Age == c("1481","5553.75","9626.49999999999","14069.5","18142.25"))
+
+
+# set colour palettes to ensure lines lay out correctly
+disp.cols <- c("<4y" = "#755A00",
+               "<16y" = "#A37D00",
+               "<28y" = "#d9a600",
+               "<40y" = "#e3bc40",
+               "<53y" = "#ecd280")
+
+# plot code
+dispage <- ggplot(disp_draws, 
+                   aes(x = Age/365,
+                       y = shape,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(agebreaks2, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins),
+              linewidth = 0.75, lineend = "round",
+              method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = disp.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#755A00", "#A37D00", "#d9a600", "#e3bc40", "#ecd280"),
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                        labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  ggtitle('D', subtitle = "Full Model: Dispersion (Predictability)") +
+  labs(x = "Age (Years)",
+       y = "Dispersion Parameter (θ)",
+       colour = "Age at Last Sighting", 
+       fill = "Age at Last Sighting", 
+       linetype = "Age at Last Sighting") +
+   guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+         fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(0,135)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans")) 
+
+#plot! 
+dispage
+```
+
+### Figure 2B (Female model)
+
+First, we create predictions for the female model using epred and linpred draws. 
+
+```{r predict fem reponses}
+#using previously built sequences for both m and f
+f.newdat <- expand.grid(
+  z.Age = ageseq,
+  z.ALS = alsseq,
+  Repro.Stat = NA,
+  Sex = "FEMALE")
+
+# unscale z.Age in new dataset
+f.newdat <- f.newdat %>%
+  mutate(Age = ((z.Age * s) + m)) %>%
+  mutate(ALS = ((z.ALS * s_als) + m_als))
+
+# draw epred -- or expectation of the posterior, i.e E(yi) of the model formula
+f.mean_draws <- mod_2 %>%
+  epred_draws(newdata = f.newdat, 
+              re_formula = NA) %>%
+  group_by(Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = mean(.epred))
+
+f.mean_draws <- f.mean_draws %>%
+  filter(Age <= ALS) %>%
+  mutate(alsbins = ALS/365) %>%
+  mutate(alsbins = as.factor(alsbins))
+
+
+#now repeat with dispersion components
+f.disp_draws <- mod_2 %>%
+  linpred_draws(newdata = f.newdat, 
+                dpar = "shape", 
+                transform = TRUE, 
+                re_formula = NA) %>%
+  group_by(Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            predicted = mean(.linpred),
+            shape = mean(shape))
+
+f.disp_draws <- f.disp_draws %>%
+  filter(Age <= ALS) %>%
+  mutate(alsbins = ALS/365) %>%
+  mutate(alsbins = as.factor(alsbins))
+
+#write.csv(f.mean_draws, "data/fig2_b_draws.csv", row.names = FALSE)
+#write.csv(f.disp_draws, "data/fig2_e_draws.csv", row.names = FALSE)
+ 
+#to import, use the following (requires "here" package)
+# f.mean_draws <- read.csv(here("FILEFOLDERNAME", "fig2_b_draws.csv"), header = TRUE, sep = ",")
+# f.disp_draws <- read.csv(here("FILEFOLDERNAME", "fig2_e_draws.csv"), header = TRUE, sep = ",")
+```
+
+```{r graph mean draws fem}
+# mean response level
+
+# prep data by fixing bins
+levels(f.mean_draws$alsbins) <- c("<4y", "<16y", "<28y", "<40y", "<53y")
+
+# set breaks for jittered points
+# slightly offset from lines for visual balance
+f.agebreaks = f.mean_draws %>%
+  filter(Age == c("1481","5553.75","9626.49999999999","14069.5","18142.25"))
+
+# set colour palettes to ensure lines lay out correctly
+f.mean.cols <- c("<4y" = "#053143",
+                 "<16y" = "#08516E",
+                 "<28y" = "#0b76a0",
+                 "<40y" = "#4898b8",
+                 "<53y" = "#85bbd0")
+
+# plot code
+f.meanage <- ggplot(f.mean_draws, 
+                   aes(x = Age/365,
+                       y = predicted,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(f.agebreaks, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins),
+              linewidth = 0.75, lineend = "round",
+              method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = f.mean.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#053143", "#08516E", "#0b76a0", "#4898b8", "#85bbd0"),
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +  
+  ggtitle('B', subtitle = "Females: Average") +
+  labs(colour = "Age at Last Sighting", fill = "Age at Last Sighting", linetype = "Age at Last Sighting") +
+  guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+         fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(2.5,7)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_blank(),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))
+
+
+# plot!
+f.meanage
+```
+
+```{r graph disp draws fem}
+#dispersion level theta/shape
+
+# prep data by fixing bins
+levels(f.disp_draws$alsbins) <- c("<4y", "<16y", "<28y", "<40y", "<53y")
+
+# set breaks for jittered points
+# slightly offset from lines for visual balance
+f.agebreaks2 = f.disp_draws %>%
+  filter(Age == c("1481","5553.75","9626.49999999999","14069.5","18142.25"))
+
+# set colour palettes to ensure lines lay out correctly
+f.disp.cols <- c("<4y" = "#2E1037",
+                 "<16y" = "#642377",
+                 "<28y" = "#A539C6",
+                 "<40y" = "#C581DA",
+                 "<53y" = "#E6C8EF")
+
+# plot code
+femdispage <- ggplot(f.disp_draws, 
+                   aes(x = Age/365,
+                       y = shape,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(f.agebreaks2, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins),              
+              linewidth = 0.75, lineend = "round",
+              method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = f.disp.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#2E1037", "#642377", "#A539C6", "#C581DA", "#E6C8EF"),
+                    labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                        labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +  
+  ggtitle('E', subtitle = "Females: Dispersion") +
+  labs(x = "Age (Years)",
+       colour = "Age at Last Sighting", 
+       fill = "Age at Last Sighting", 
+       linetype = "Age at Last Sighting") +
+  guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+         fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(0,135)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title.x = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))  
+
+# plot!
+femdispage
+```
+
+We additionally plotted this figure with its default y-axis to improve readability.
+
+```{r graph disp draws fem 2}
+#dispersion level theta/shape
+
+# plot code
+femdispage_zoom <- ggplot(f.disp_draws, 
+                   aes(x = Age/365,
+                       y = shape,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(f.agebreaks2, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins),              
+              linewidth = 0.75, lineend = "round",
+              method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = f.disp.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#2E1037", "#642377", "#A539C6", "#C581DA", "#E6C8EF"),
+                    labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                        labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +  
+  ggtitle('E', subtitle = "Females: Dispersion") +
+  labs(x = "Age (Years)",
+       colour = "Age at Last Sighting", 
+       fill = "Age at Last Sighting", 
+       linetype = "Age at Last Sighting") +
+  guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+         fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title.x = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))  
+
+# plot!
+femdispage_zoom
+```
+
+### Figure 2C (Male model)
+
+First, we create predictions for the male empirical using epred and linpred draws. 
+
+```{r predict male reponses}
+#using previously built sequences for both m and f
+m.newdat <- expand.grid(
+  z.Age = ageseq,
+  z.ALS = alsseq,
+  Repro.Stat = NA,
+  Sex = "MALE")
+
+# unscale z.Age in new dataset
+m.newdat <- m.newdat %>%
+  mutate(Age = ((z.Age * s) + m)) %>%
+  mutate(ALS = ((z.ALS * s_als) + m_als))
+
+# draw epred -- or expectation of the posterior, i.e E(yi) of the model formula
+m.mean_draws <- mod_2 %>%
+  epred_draws(newdata = m.newdat, 
+              re_formula = NA) %>%
+  group_by(Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = mean(.epred))
+
+m.mean_draws <- m.mean_draws %>%
+  filter(Age <= ALS) %>%
+  mutate(alsbins = ALS/365) %>%
+  mutate(alsbins = as.factor(alsbins))
+
+
+
+#now repeat with dispersion components
+m.disp_draws <- mod_2 %>%
+  linpred_draws(newdata = m.newdat, 
+                dpar = "shape", 
+                transform = TRUE, 
+                re_formula = NA) %>%
+  group_by(Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            predicted = mean(.linpred),
+            shape = mean(shape))
+
+m.disp_draws <- m.disp_draws %>%
+  filter(Age <= ALS) %>%
+  mutate(alsbins = ALS/365) %>%
+  mutate(alsbins = as.factor(alsbins))
+
+#write.csv(m.mean_draws, "data/fig2_c_draws.csv", row.names = FALSE)
+#write.csv(m.disp_draws, "data/fig2_f_draws.csv", row.names = FALSE)
+ 
+#to import, use the following (requires "here" package)
+# m.mean_draws <- read.csv(here("FILEFOLDERNAME", "fig2_c_draws.csv"), header = TRUE, sep = ",")
+# m.disp_draws <- read.csv(here("FILEFOLDERNAME", "fig2_f_draws.csv"), header = TRUE, sep = ",")
+```
+
+```{r graph mean draws male}
+# mean response level
+
+# prep data by fixing bins
+#m.mean_draws$alsbins <- factor(m.mean_draws$alsbins, levels = rev(levels(m.mean_draws$alsbins)))
+levels(m.mean_draws$alsbins) <- c("<4y", "<16y", "<28y", "<40y", "<53y")
+
+# set breaks for jittered points
+# slightly offset from geom lines for visual balance
+m.agebreaks = m.mean_draws %>%
+  filter(Age == c("1481","5553.75","9626.49999999999","14069.5","18142.25"))
+
+# set colour palettes to ensure lines lay out correctly
+m.mean.cols <- c("<4y" = "#6A2B0C",
+                 "<16y" = "#C04F15",
+                 "<28y" = "#E65D1A",
+                 "<40y" = "#EF986C",
+                 "<53y" = "#e0a78a")
+
+# plot code
+m.meanage <- ggplot(m.mean_draws, 
+                   aes(x = Age/365,
+                       y = predicted,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(m.agebreaks, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins), 
+              linewidth = 0.75, lineend = "round",
+  method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = m.mean.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#6A2B0C", "#C04F15", "#E65D1A", "#EF986C", "#e0a78a"),
+                    labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                        labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  ggtitle('C', subtitle = "Males: Average") +
+  labs(colour = "Age at Last Sighting", fill = "Age at Last Sighting", linetype = "Age at Last Sighting") +
+  guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+         fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(2.5,7)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_blank(),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans")) +
+  theme(legend.position = "bottom") 
+
+# plot!
+m.meanage
+
+```
+
+```{r graph disp draws male}
+#dispersion level theta/shape
+
+# prep data by fixing bins
+levels(m.disp_draws$alsbins) <- c("<4y", "<16y", "<28y", "<40y", "<53y")
+
+# set breaks for jittered points
+# slightly offset from geom lines for visual balance
+m.agebreaks2 = m.disp_draws %>%
+  filter(Age == c("1481","5553.75","9626.49999999999","14069.5","18142.25"))
+
+# set colour palettes to ensure lines lay out correctly
+m.disp.cols <- c("<4y" = "#700F0F",
+                 "<16y" = "#901414",
+                 "<28y" = "#B81919",
+                 "<40y" = "#EB6F6F",
+                 "<53y" = "#F6C0C0")
+
+# plot code
+maledispage <- ggplot(m.disp_draws, 
+                   aes(x = Age/365,
+                       y = shape,
+                       colour = alsbins)) +
+  geom_jitter(data = slice_sample(m.agebreaks2, n = 100),
+              aes(fill = as.factor(Age)),
+              size = 1, 
+              alpha = 0.5, 
+              width = 2,
+              shape = 21,
+              stroke = 0,
+              show.legend = TRUE) +
+  geom_smooth(aes(linetype = alsbins),            
+              linewidth = 0.75, lineend = "round",
+              method = "gam", formula = y ~ s(x, bs = "cs", k = 4), se = FALSE, show.legend = TRUE) +
+  scale_colour_manual(values = m.disp.cols,
+                      labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_fill_manual(values = c("#700F0F", "#901414", "#B81919", "#EB6F6F", "#F6C0C0"),
+                    labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  scale_linetype_manual(values = c(3,4,2,5,1),
+                        labels = c("<4y", "<16y", "<28y", "<40y", "<53y")) +
+  ggtitle('F', subtitle = "Males: Dispersion ") +
+  labs(x = "Age (Years)",
+       colour = "Age at Last Sighting", 
+       fill = "Age at Last Sighting", 
+       linetype = "Age at Last Sighting") +  
+   guides(color = guide_legend(override.aes = list(color = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"))),
+          fill = guide_legend(override.aes = list(fill = c("#000000", "#303030", "#616161", "#919191", "#C2C2C2"),
+                                                  size = 3,
+                                                  alpha = 1))) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(0,135)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title.x = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))
+
+# plot!
+maledispage
+```
+
+### Combine plots
+
+```{r combine fig 2 plots, fig.align='center', fig.width=8, fig.height=10}
+fig2layout <- "
+  ABC
+  ABC
+  DEf
+  DEf
+"
+A = meanage
+B = f.meanage
+C = m.meanage
+D = dispage
+E = femdispage 
+f = maledispage
+
+figure2 <- wrap_plots(A = A, 
+                      B = B, 
+                      C = C,
+                      D = D, 
+                      E = E, 
+                      f = f,
+                      design = fig2layout) + plot_layout(guides = "collect") & theme(legend.position = "bottom",
+                                                                                     legend.title = element_blank(),
+                                                                                     legend.text = element_text(size = 9, colour = "black"))
+
+figure2
+
+#ggsave(figure2, filename = here("figures", "Fig2.tiff"), bg = "transparent", device = 'tiff', height = 22, width = 17.5, units = "cm", compression = "lzw")
+
+```
+
+## Figure 3 {.tabset}
+
+### Figure 3 (Extract all draws)
+
+```{r import edpred objects, echo = FALSE}
+fem_dolphin_epred_draws <- readRDS(here("fits", "fem_dolphin_epred_draws.rds"))
+fem_dolphin_epred_draws_disp <- readRDS(here("fits", "fem_dolphin_epred_draws_disp.rds"))
+
+male_dolphin_epred_draws <- readRDS(here("fits", "male_dolphin_epred_draws.rds"))
+male_dolphin_epred_draws_disp <- readRDS(here("fits", "male_dolphin_epred_draws_disp.rds"))
+```
+
+```{r all draws for use plotting individual graphs, eval=F}
+
+# create new sequence of data to predict on from the model
+allseq <- seq_range(dat$z.Age, n = 54) #  points per year approximately
+
+# needed to unscale z.Age
+m = mean(dat$ObsAge)
+s <- sd(dat$ObsAge)
+
+#create new sequence of ALS data to predict on from the model
+alsseq <- seq_range(dat$z.ALS, n = 54, expand = 0.15)  
+
+# needed to unscale ALS
+m_als <- mean(dat$ALS)
+s_als <- sd(dat$ALS)
+
+# creating lists of dolphin ids
+# predictions are done separately to prevent computational waste on generation predictions for inaccurate sexes
+femdolphins <- levels(females$Dolphin.ID) 
+maledolphins <- levels(males$Dolphin.ID)
+
+#create new datasets to plug into 
+f.epred_dat <- expand.grid(
+  z.Age = allseq,
+  z.ALS = alsseq,
+  Sex = "FEMALE",
+  Repro.Stat = NA,
+  Dolphin.ID = femdolphins,
+  Observation.Date = NA,
+  Year = NA) %>%
+  mutate(Age = ((z.Age * s) + m)) %>%
+  mutate(ALS = ((z.ALS * s_als) + m_als))
+
+m.epred_dat <- expand.grid(
+  z.Age = allseq,
+  z.ALS = alsseq,
+  Sex = "MALE",
+  Repro.Stat = NA,
+  Dolphin.ID = maledolphins,
+  Observation.Date = NA,
+  Year = NA) %>%
+  mutate(Age = ((z.Age * s) + m)) %>%
+  mutate(ALS = ((z.ALS * s_als) + m_als))
+
+# predict expected effects for individuals. 
+
+fem_dolphin_epred_draws <- mod_2 %>%
+  epred_draws(newdata = f.epred_dat,
+              re_formula = NULL,
+              allow_new_levels = TRUE,
+              ndraws = 20) %>% 
+  group_by(Dolphin.ID, Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = .epred)
+
+# this is to check existing ALS for selecting assorted dolphins for the next plots
+f.id_als <- females %>%
+  select(Dolphin.ID,
+         Sex,
+         ALS) %>%
+  distinct() %>%
+  mutate(yls = ALS/365) %>%
+  rename(alstrue = ALS)
+
+fem_dolphin_epred_draws <- fem_dolphin_epred_draws %>%
+  left_join(f.id_als, by = c("Dolphin.ID")) %>%
+  group_by(Dolphin.ID) %>%
+  filter(Age >= 0) %>%
+  filter(Age < alstrue) %>%
+  filter(abs(ALS - alstrue) <= 365) %>%
+  droplevels()
+
+# saveRDS(fem_dolphin_epred_draws, file = "fits/fem_dolphin_epred_draws.rds")
+
+male_dolphin_epred_draws <- mod_2 %>%
+  epred_draws(newdata = m.epred_dat,
+              re_formula = NULL,
+              allow_new_levels = TRUE,
+              ndraws = 20) %>% 
+  group_by(Dolphin.ID, Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = .epred)
+
+# this is to check existing ALS for selecting assorted dolphins for the next plots
+m.id_als <- males %>%
+  select(Dolphin.ID,
+         Sex,
+         ALS) %>%
+  distinct() %>%
+  mutate(yls = ALS/365) %>%
+  rename(alstrue = ALS)
+
+male_dolphin_epred_draws <- male_dolphin_epred_draws %>%
+  left_join(m.id_als, by = c("Dolphin.ID")) %>%
+  group_by(Dolphin.ID) %>%
+  filter(Age >= 0) %>%
+  filter(Age < alstrue) %>%
+  filter(abs(ALS - alstrue) <= 365) %>%
+  droplevels()
+
+# now repeat with dispersion components. 
+# what we really want here is "shape" as that is the dispersion parameter
+# theta described in methodology, ie measure of variance
+
+fem_dolphin_epred_draws_disp <- mod_2 %>%
+  linpred_draws(newdata = f.epred_dat, 
+                re_formula = NULL,
+                allow_new_levels = TRUE,
+                dpar = "shape", 
+                transform = TRUE,
+                ndraws = 20) %>% 
+  group_by(Dolphin.ID, Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = mean(.linpred),
+            shape = mean(shape))
+
+fem_dolphin_epred_draws_disp <- fem_dolphin_epred_draws_disp %>%
+  left_join(f.id_als, by = c("Dolphin.ID")) %>%
+  group_by(Dolphin.ID) %>%
+  filter(Age >= 0) %>%
+  filter(Age < alstrue) %>%
+  filter(abs(ALS - alstrue) <= 365) %>%
+  droplevels()
+
+male_dolphin_epred_draws_disp <- mod_2 %>%
+  linpred_draws(newdata = m.epred_dat, 
+                re_formula = NULL,
+                allow_new_levels = TRUE,
+                dpar = "shape", 
+                transform = TRUE,
+                ndraws = 20) %>% 
+  group_by(Dolphin.ID, Age, ALS, .draw) %>%
+  summarise(Age = mean(Age),
+            ALS = mean(ALS),
+            predicted = mean(.linpred),
+            shape = mean(shape))
+
+male_dolphin_epred_draws_disp <- male_dolphin_epred_draws_disp %>%
+  left_join(m.id_als, by = c("Dolphin.ID")) %>%
+  group_by(Dolphin.ID) %>%
+  filter(Age >= 0) %>%
+  filter(Age < alstrue) %>%
+  filter(abs(ALS - alstrue) <= 365) %>%
+  droplevels()
+```
+
+```{r view draws}
+head(fem_dolphin_epred_draws)
+head(fem_dolphin_epred_draws_disp)
+
+head(male_dolphin_epred_draws)
+head(male_dolphin_epred_draws_disp)
+```
+
+```{r fig 3 avg draws}
+draws_dat <- rbind(fem_dolphin_epred_draws, male_dolphin_epred_draws)
+
+write.csv(draws_dat, "data/fig3_mean_draws.csv", row.names = FALSE)
+
+#to import, use the following (requires "here" package)
+# draws_dat <- read.csv(here("FILEFOLDERNAME", "fig3_mean_draws.csv"), header = TRUE, sep = ",")
+
+# plot average draws
+draws_plot <- ggplot(draws_dat, 
+                   aes(x = Age/365,
+                       y = predicted,
+                       color = Sex,
+                       group = Dolphin.ID)) +
+  stat_smooth(geom = "line", alpha = 0.3,
+            linewidth = 0.4, lineend = "round", 
+            method = "gam", formula = y ~ poly(x,2), show.legend = FALSE)+
+  ggtitle('A', subtitle = "Average ") +
+  labs(x = "Age (Years)",
+       y = "Predicted Associates") +
+   scale_colour_manual(values = c("#08516E", "#C04F15"),
+                      labels = c("Females", "Males")) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(1.5,10)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))
+
+draws_plot
+
+```
+
+
+```{r fig 4 disp draws}
+disp_dat <- rbind(fem_dolphin_epred_draws_disp, male_dolphin_epred_draws_disp)
+
+#write.csv(disp_dat, "data/fig3_disp_draws.csv", row.names = FALSE)
+
+#to import, use the following (requires "here" package)
+# disp_dat <- read.csv(here("FILEFOLDERNAME", "fig3_disp_draws.csv"), header = TRUE, sep = ",")
+
+
+# this filter is applied to reduce extreme lines and make interpretation more broadly visible
+visfilter <- disp_dat %>%
+  group_by(Dolphin.ID) %>%
+  filter(max(shape) < 3500)
+
+# plot disp draws
+disp_plot <- ggplot(visfilter, 
+                   aes(x = Age/365,
+                       y = shape,
+                       color = Sex,
+                       group = Dolphin.ID)) +
+  stat_smooth(geom = "line", alpha = 0.3,
+            linewidth = 0.4, lineend = "round", 
+            method = "gam", formula = y ~ s(x, bs = "cs", k = 3), show.legend = TRUE)+
+  ggtitle('B', subtitle = "Dispersion") +
+  labs(x = "Age (Years)",
+       y = "Dispersion Parameter (θ)") +
+  scale_colour_manual(values = c("#4898b8", "#EF986C"),
+                      labels = c("Females", "Males")) +
+  scale_x_continuous(expand = expansion(mult = 0)) +
+  scale_y_continuous(expand = expansion(mult = 0)) +
+  coord_cartesian(xlim = c(0,54), ylim = c(0,425)) +
+  theme(panel.background = element_rect(fill = "transparent", 
+                                        linetype = 0), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_text(size = 9, 
+                                   colour = "black"),
+        text = element_text(family = "sans"))
+
+
+
+disp_plot
+```
+
+
+```{r combine fig 3 plots, fig.align='center', fig.width=8, fig.height=10}
+fig3layout <- "
+  AB
+  AB
+"
+A = draws_plot
+B = disp_plot
+
+
+figure3 <- wrap_plots(A = A, 
+                      B = B, 
+                      design = fig3layout) + 
+  plot_layout(guides = "collect") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) &
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 9, colour = "black"))
+
+figure3
+
+#ggsave(figure3, filename = here("figures", "Fig3.tiff"), bg = "transparent", device = 'tiff', height = 18, width = 18, units = "cm", compression = "lzw")
+
+```
+
+## Figure 4 {.tabset}
+
+### Figure 4A (Latent Response)
+
+```{r find variables, eval=FALSE}
+# figure out where the requisite variables are
+options(max.print = 2000)
+head(get_variables(mod_2),2000)
+# "r_Dolphin.ID[XXX,Intercept]"   runs from 48 to 504
+# "r_Dolphin.ID__shape[XXX,Intercept]"    runs from 1419 to 1875
+# codes are ABC to ZOE
+```
+
+```{r create first figure}
+#create table of draws
+mean.id.posterior <- as_draws_df(mod_2)[,48:504] %>% #this throws a warning but it works 
+  gather(Dolphin.ID, value,
+         "r_Dolphin.ID[ABC,Intercept]" : "r_Dolphin.ID[ZUF,Intercept]") %>% # replace with anon_id and codes
+  separate(Dolphin.ID, c(NA,NA,"Dolphin.ID", NA, NA),
+           sep = "([\\_\\[\\,])", fill = "right") 
+
+# need to add sex into this for colour
+datsex <- dat %>%
+  select(Dolphin.ID, #anon_id
+         Sex) %>%
+  distinct(Dolphin.ID, .keep_all = T) #remember to reduce to one row per animal lol
+
+mean.id.posterior.s <- left_join(mean.id.posterior, datsex, by = "Dolphin.ID")
+
+mean.id.posterior.s <- mean.id.posterior.s %>%
+  group_by(Dolphin.ID) %>%
+  mutate(medval.s = median(value))%>%
+  rename(value.s = value) %>%
+  ungroup()
+
+#write.csv(mean.id.posterior.s, "data/fig4_a.csv", row.names = FALSE)
+
+#to import, use the following (requires "here" package)
+# mean.id.posterior.s <- read.csv(here("FILEFOLDERNAME", "fig4_a.csv"), header = TRUE, sep = ",")
+
+```
+
+```{r 4a plot}
+mean.id.plot <- ggplot(mean.id.posterior.s,
+                       aes(x = value.s,
+                           y = reorder(Dolphin.ID, medval.s),
+                           colour = Sex,
+                           fill = Sex)) +
+  stat_pointinterval(.width = 0.95, linewidth = 0.01, point_size = 0.1, alpha = 0.7) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) + # specifies CI colours
+  labs(x = "Mean Sociability (Log)", 
+       y = "Dolphin ID") +
+  ggtitle("A", subtitle = "Individual Mean Sociability") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        panel.background = element_rect(fill = "transparent",
+                                        colour = NA), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        legend.position = "none",
+        legend.background = element_rect(fill = "transparent")) + 
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_text(size = 9, 
+                                 colour = "black"),
+        text = element_text(family = "sans")) 
+```
+
+### Figure 4B (Predictability)
+
+```{r create tables for graph 4b}
+pred.id.posterior <- as_draws_df(mod_2)[,1419:1875] %>%
+  gather(Dolphin.ID, value,
+         "r_Dolphin.ID__shape[ABC,Intercept]" : "r_Dolphin.ID__shape[ZUF,Intercept]") %>%
+  separate(Dolphin.ID, c(NA,NA,NA, NA, "Dolphin.ID", NA),
+           sep = "([\\_\\__\\[\\,])", fill = "right") 
+
+
+pred.id.posterior.s <- left_join(pred.id.posterior, datsex, by = "Dolphin.ID")
+
+pred.id.posterior.s <- pred.id.posterior.s %>%
+  group_by(Dolphin.ID) %>%
+  mutate(medval.p = median(value))%>%
+  rename(value.p = value) %>%
+  ungroup()
+
+write.csv(pred.id.posterior.s, "data/fig4_b.csv", row.names = FALSE)
+
+# to import, use the following (requires "here" package)
+# pred.id.posterior.s <- read.csv(here("FILEFOLDERNAME", "fig4_b.csv"), header = TRUE, sep = ",")
+```
+
+```{r figure 4b plot}
+pred.id.plot <- ggplot(pred.id.posterior.s,
+                       aes(y = reorder(Dolphin.ID, medval.p),
+                           x = value.p,
+                           colour = Sex,
+                           fill = Sex)) +
+  stat_pointinterval(.width = 0.95, linewidth = 0.01, point_size = 0.1, alpha = 0.7) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) + # specifies CI colours
+  labs(x = "Social Predictability (Log)", 
+       y = "Dolphin ID") +
+  ggtitle("B", subtitle = "Individual Social Predictability") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        panel.background = element_rect(fill = "transparent",
+                                        colour = NA), 
+        plot.background = element_rect(fill = "transparent", 
+                                       color = NA),
+        legend.position = "bottom",
+        legend.background = element_rect(fill = "transparent")) + 
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_text(size = 9, 
+                                 colour = "black"),
+        text = element_text(family = "sans")) 
+```
+
+### Figure 4C (Correlation)
+
+```{r create table of data}
+#summary stats for plots
+soc.mean.sum <- mean.id.posterior.s %>%
+  group_by(Dolphin.ID) %>%
+  summarise(mean.pos.s = mean(value.s, na.rm = TRUE),
+            med.pos.s = median(value.s, na.rm = TRUE),
+            sd.pos.s = sd(value.s, na.rm = TRUE),
+            n.pos.s = n()) %>%
+  mutate(lower.ci.pos.s = mean.pos.s - sd.pos.s,
+         upper.ci.pos.s = mean.pos.s + sd.pos.s)
+
+soc.pred.sum <- pred.id.posterior.s %>%
+  group_by(Dolphin.ID) %>%
+  summarise(mean.pos.p = mean(value.p, na.rm = TRUE),
+            med.pos.p = median(value.p, na.rm = TRUE),
+            sd.pos.p = sd(value.p, na.rm = TRUE),
+            n.pos.p = n()) %>%
+  mutate(lower.ci.pos.p = mean.pos.p - sd.pos.p,
+         upper.ci.pos.p = mean.pos.p + sd.pos.p)
+
+#### correlations table ####
+soc.pred.corr <- purrr::reduce(list(soc.mean.sum, soc.pred.sum, datsex), 
+                               dplyr::left_join, by = "Dolphin.ID") # anon_id
+
+# write.csv(soc.pred.corr, "data/fig4_c.csv", row.names = FALSE)
+
+# to import, use the following (requires "here" package)
+# soc.pred.corr <- read.csv(here("FILEFOLDERNAME", "fig4_c.csv"), header = TRUE, sep = ",")
+```
+
+```{r figure 4c plot}
+corr.id.plot <- ggplot(soc.pred.corr,
+                       aes(x = med.pos.s,
+                           y = med.pos.p,
+                           colour = Sex)) +
+  scale_colour_manual(values = c("#0B76A0", "#C04F15")) + # specifies CI colours
+  labs(x = "Mean Sociability (Log)", 
+       y = "Social Predictability (Log)") +
+  geom_point(size = 0.1) +
+  geom_errorbar(aes(ymin = lower.ci.pos.p,  #this one for predictability error bars
+                    ymax = upper.ci.pos.p),
+                alpha = 0.7, #this will look too dark normally but appears well in ggsave figure
+                linewidth = 0.075) +
+  geom_errorbarh(aes(xmin = lower.ci.pos.s,#this one for mean sociality error bars 
+                     xmax = upper.ci.pos.s),
+                 alpha = 0.75,
+                 linewidth = 0.075) + 
+  ggtitle("C", subtitle = "Correlation") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = "transparent",
+                                        colour = NA), 
+        plot.background = element_rect(fill = "transparent",  
+                                       color = NA),
+        legend.position = "none",
+        legend.background = element_rect(fill = "transparent")) +
+  theme(plot.title = element_text(face = "bold",
+                                  size = 13),
+        plot.subtitle = element_text(face = "italic",
+                                     size = 9),
+        axis.title = element_text(face = "bold",
+                                  size = 9,
+                                  colour = "black"),
+        axis.text = element_text(size = 9, 
+                                 colour = "black"),
+        text = element_text(family = "sans")) 
+
+```
+
+### Combine plots
+```{r full fig 4}
+a4 <- mean.id.plot + guides()
+
+b4 <- pred.id.plot + guides()
+
+c4 <- corr.id.plot + guides(colour = "none")
+
+figure4 <- a4 + b4 + c4 +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom",
+        legend.background = element_rect(colour = "transparent"))
+```
+
+```{r display figure4, fig.align='center', fig.width=8, fig.height=8}
+figure4
+
+#ggsave(figure4, filename = here("figures", "Fig4.tiff"), bg = "transparent", device = 'tiff', height = 14, width = 18, units = "cm", dpi = 300, compression = "lzw")
+```
+
+# **Session Info**
+
+```{r session info}
+sessionInfo()
+``` 
