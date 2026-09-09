@@ -1,8 +1,10 @@
 ## Social aging in dolphins
 
+[Zenodo DOI](https://doi.org/10.5281/zenodo.22675472)
+
 This repo contains data and code for the analyses in:
 
-  >Meehan, K.C., Class, B., Nakagawa, S., MacQueeney, M., Foroughirad, V., Mann, J. and Frere, C.H., 2026 PREPRINT. Social aging in dolphins. <i>EcoEvoRxiv</i> [doi: 10.32942/X2KW8W](https://doi.org/10.32942/X2KW8W)
+  > Under Review
 
 ## Analysis Code and HTML
 
